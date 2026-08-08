@@ -120,13 +120,17 @@ The process listens on `0.0.0.0:$PORT` with **one worker**.
 
 ## Used by Great Big World (mobile app)
 
-The MAUI app calls this service at:
+Production host:
 
-`https://greatbigwolrd-tts-production.up.railway.app/tts`
+`https://greatbigwolrd-tts-production.up.railway.app`
 
-App-side integration lives in the Great Big World mobile repository (`KokoroSpeechService`).
-That app build must be reinstalled on a device to pick up TTS changes; pushing this
-TTS repo only redeploys the speech API.
+The MAUI app calls `POST /tts` with a selected Kokoro `voice` (for example `af_heart`,
+`af_bella`, `bf_emma`). Users change voices in the app **Settings → Guide voice** picker.
+List server voices with `GET /voices`.
+
+Push policy: keep this repo in sync with the `tts/` folder from
+`jdheitmann/Great-Big-World` whenever TTS server files change.
+
 
 ---
 
