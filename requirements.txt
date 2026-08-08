@@ -1,0 +1,13 @@
+# Web
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+python-multipart==0.0.20
+
+# Kokoro TTS (pulls misaki[en], transformers, huggingface-hub, etc.)
+kokoro==0.9.4
+soundfile==0.13.1
+numpy==2.2.5
+
+# Note: torch is installed separately in the Dockerfile from the official
+# CPU-only PyTorch index to avoid CUDA packages.
