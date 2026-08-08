@@ -118,6 +118,16 @@ docker run --rm -p 8000:8000 \
 
 The process listens on `0.0.0.0:$PORT` with **one worker**.
 
+## Used by Great Big World (mobile app)
+
+The MAUI app calls this service at:
+
+`https://greatbigwolrd-tts-production.up.railway.app/tts`
+
+App-side integration lives in the Great Big World mobile repository (`KokoroSpeechService`).
+That app build must be reinstalled on a device to pick up TTS changes; pushing this
+TTS repo only redeploys the speech API.
+
 ---
 
 ## Environment variables
