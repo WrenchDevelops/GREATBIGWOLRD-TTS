@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -38,15 +39,29 @@ class TTSEngine:
         self._default_voice = settings.default_voice
         self._init_seconds: Optional[float] = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_tts)
+        # Shared KModel/KPipeline is not safe for overlapping torch inference.
+        self._infer_lock = threading.Lock()
         # One worker thread per concurrent TTS slot keeps RAM predictable.
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_concurrent_tts,
             thread_name_prefix="kokoro-tts",
         )
+        self._consecutive_timeouts = 0
+        self._active_generations = 0
+        self._active_started_at: Optional[float] = None
+        self._stats_lock = threading.Lock()
 
     @property
     def ready(self) -> bool:
-        return self._ready
+        if not self._ready:
+            return False
+        # If a timed-out worker is still stuck past 2x the request budget,
+        # fail health so the platform restarts the process.
+        if self._workers_appear_stuck():
+            logger.error("TTS worker appears stuck; marking engine not ready for restart")
+            self._ready = False
+            return False
+        return True
 
     @property
     def default_voice(self) -> str:
@@ -55,6 +70,13 @@ class TTSEngine:
     @property
     def init_seconds(self) -> Optional[float]:
         return self._init_seconds
+
+    def _workers_appear_stuck(self) -> bool:
+        with self._stats_lock:
+            if self._active_generations <= 0 or self._active_started_at is None:
+                return False
+            stuck_after = max(180.0, self.settings.request_timeout_seconds * 2)
+            return (time.perf_counter() - self._active_started_at) > stuck_after
 
     def initialize(self) -> None:
         """Load Kokoro once at startup. Safe to call only from lifespan startup."""
@@ -100,6 +122,7 @@ class TTSEngine:
             raise RuntimeError("Warmup synthesis produced empty audio")
 
         self._ready = True
+        self._consecutive_timeouts = 0
         self._init_seconds = time.perf_counter() - started
         logger.info(
             "Kokoro ready in %.2fs default_voice=%s concurrent=%s torch_threads=%s warmup_samples=%s",
@@ -214,10 +237,39 @@ class TTSEngine:
         if voice not in SUPPORTED_VOICES:
             raise ValueError(f"Unsupported voice: {voice}")
 
-        audio = self._synthesize_numpy(text, voice=voice, speed=speed)
+        # Serialize torch inference — concurrent calls on one KModel deadlock/hang on CPU.
+        with self._infer_lock:
+            with self._stats_lock:
+                self._active_generations += 1
+                if self._active_started_at is None:
+                    self._active_started_at = time.perf_counter()
+            try:
+                audio = self._synthesize_numpy(text, voice=voice, speed=speed)
+            finally:
+                with self._stats_lock:
+                    self._active_generations = max(0, self._active_generations - 1)
+                    if self._active_generations == 0:
+                        self._active_started_at = None
+
         if audio.size == 0:
             raise RuntimeError("Synthesis produced empty audio")
         return self._encode_audio(audio, fmt)
+
+    def _note_success(self) -> None:
+        self._consecutive_timeouts = 0
+
+    def _note_timeout(self, kind: str) -> None:
+        self._consecutive_timeouts += 1
+        logger.error(
+            "TTS %s timeout consecutive=%s",
+            kind,
+            self._consecutive_timeouts,
+        )
+        # After repeated timeouts the thread pool is likely wedged; fail health
+        # so Railway/Docker restarts a clean process.
+        if self._consecutive_timeouts >= 2:
+            logger.error("Marking TTS engine not ready after repeated timeouts")
+            self._ready = False
 
     async def generate(
         self,
@@ -228,14 +280,16 @@ class TTSEngine:
         timeout_seconds: float,
     ) -> bytes:
         """Generate audio with concurrency limiting and timeout protection."""
+        queue_wait_started = time.perf_counter()
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
+            self._note_timeout("queue")
             raise TimeoutError("Timed out waiting for a free TTS worker") from exc
 
+        queue_ms = int((time.perf_counter() - queue_wait_started) * 1000)
         loop = asyncio.get_running_loop()
-        started = time.perf_counter()
-        remaining = max(0.1, timeout_seconds - (time.perf_counter() - started))
+        remaining = max(0.1, timeout_seconds - (time.perf_counter() - queue_wait_started))
         future = loop.run_in_executor(
             self._executor,
             self.generate_sync,
@@ -245,17 +299,24 @@ class TTSEngine:
             fmt,
         )
 
+        release_on_exit = True
         try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+            result = await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+            self._note_success()
+            if queue_ms > 50:
+                logger.info("TTS queue wait ms=%s", queue_ms)
+            return result
         except asyncio.TimeoutError as exc:
             # Keep the slot occupied until the worker finishes so RAM stays bounded.
+            # Do NOT release here — a return inside `try` would also skip a bare
+            # `else:` release (that bug wedged production after 2 successes).
+            release_on_exit = False
             future.add_done_callback(lambda _f: self._semaphore.release())
+            self._note_timeout("generation")
             raise TimeoutError("TTS generation timed out") from exc
-        except Exception:
-            self._semaphore.release()
-            raise
-        else:
-            self._semaphore.release()
+        finally:
+            if release_on_exit:
+                self._semaphore.release()
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

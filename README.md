@@ -7,7 +7,7 @@ Production-ready FastAPI service designed for **Railway**, **CPU-only**,
 
 - One shared Kokoro model loaded at startup
 - Single Uvicorn worker (no duplicated model RAM)
-- Configurable internal concurrency (default **2**)
+- Single in-flight generation by default (shared model is not thread-safe)
 - Disk audio cache with SHA-256 keys
 - Optional Bearer API key auth
 - WAV + MP3 output (MP3 default)
@@ -100,7 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```bash
 docker build -t kokoro-tts-api .
 docker run --rm -p 8000:8000 \
-  -e MAX_CONCURRENT_TTS=2 \
+  -e MAX_CONCURRENT_TTS=1 \
   -e CACHE_DIR=/app/cache \
   -v kokoro-cache:/app/cache \
   kokoro-tts-api
@@ -144,8 +144,8 @@ Push policy: keep this repo in sync with the `tts/` folder from
 | `DEFAULT_VOICE` | `af_heart` | Default Kokoro voice |
 | `DEFAULT_FORMAT` | `mp3` | `mp3` or `wav` |
 | `MAX_TEXT_LENGTH` | `2000` | Max characters per request |
-| `MAX_CONCURRENT_TTS` | `2` | Simultaneous generations |
-| `TORCH_NUM_THREADS` | `3` | PyTorch intra-op threads |
+| `MAX_CONCURRENT_TTS` | `1` | In-flight generations (keep at 1) |
+| `TORCH_NUM_THREADS` | `4` | PyTorch intra-op threads |
 | `TORCH_NUM_INTEROP_THREADS` | `1` | PyTorch inter-op threads |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Queue + generation timeout |
 | `CACHE_ENABLED` | `true` | Enable disk cache |
@@ -157,22 +157,23 @@ Push policy: keep this repo in sync with the `tts/` folder from
 ### Recommended for 8 vCPU / 8 GB
 
 ```bash
-MAX_CONCURRENT_TTS=2
-TORCH_NUM_THREADS=3
+MAX_CONCURRENT_TTS=1
+TORCH_NUM_THREADS=4
 CACHE_ENABLED=true
 CACHE_DIR=/app/cache
 CACHE_MAX_BYTES=2147483648
 DEFAULT_VOICE=af_heart
 ```
 
-Why **2 concurrent jobs**?
+Why **1 concurrent job**?
 
-- Kokoro-82M is small, but CPU inference + audio encode still uses memory and cores.
-- Two jobs × ~3 torch threads keeps utilization high without RAM spikes.
-- Prefer voice quality and stability over peak throughput.
-- You can try `MAX_CONCURRENT_TTS=3` if memory stays comfortably under ~6 GB; avoid 4+ on 8 GB.
+- One shared `KModel` is loaded in-process; overlapping torch inference can hang.
+- A threading lock serializes synthesis even if you raise the limit.
+- Spend CPU on one high-quality job (`TORCH_NUM_THREADS=4`) instead of contending jobs.
 
 **Do not** raise Uvicorn/Gunicorn `--workers` above 1 — each worker would reload the model.
+
+If Railway still has `MAX_CONCURRENT_TTS=2` set, either remove it or set it to `1`. After deploy, **restart** the service once if play is still stuck (a prior worker-slot leak may have wedged the live replica).
 
 ---
 

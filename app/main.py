@@ -253,7 +253,7 @@ async def synthesize(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except TimeoutError as exc:
-        logger.error("generation timeout chars=%s voice=%s", len(text), voice)
+        logger.error("generation timeout chars=%s voice=%s detail=%s", len(text), voice, exc)
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("generation failed chars=%s voice=%s", len(text), voice)

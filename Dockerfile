@@ -10,9 +10,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/models/huggingface \
     HUGGINGFACE_HUB_CACHE=/models/huggingface \
     TORCH_HOME=/models/torch \
-    OMP_NUM_THREADS=3 \
-    MKL_NUM_THREADS=3 \
-    OPENBLAS_NUM_THREADS=3 \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=4 \
     NUMEXPR_NUM_THREADS=1 \
     MALLOC_ARENA_MAX=2 \
     PORT=8000
@@ -36,7 +36,8 @@ RUN pip install --upgrade pip \
         torch==2.6.0
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt \
+    && python -m spacy download en_core_web_sm
 
 # Pre-download Kokoro-82M weights (Apache-2.0) for reliable cold starts.
 RUN mkdir -p /models/huggingface \
