@@ -153,6 +153,12 @@ async def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
     )
 
 
+@app.get("/warmup", response_model=HealthResponse, include_in_schema=False)
+async def warmup(settings: Settings = Depends(get_settings)) -> HealthResponse:
+    """Alias of /health for clients that keep the Railway service warm."""
+    return await health(settings)
+
+
 @app.get("/voices", response_model=VoicesResponse, dependencies=[Depends(require_api_key)])
 async def list_voices(settings: Settings = Depends(get_settings)) -> VoicesResponse:
     voices = [

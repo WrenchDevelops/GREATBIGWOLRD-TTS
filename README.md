@@ -29,6 +29,15 @@ Default voice: **`af_heart`** (high-quality American English).
 }
 ```
 
+`GET /warmup` is an alias of `/health` for keep-warm pings.
+
+### Important latency note
+
+`POST /tts` waits until the **entire** audio file is generated, then returns bytes.
+There is no HTTP audio streaming. Clients should send **short segments** (1–3 sentences)
+and start playback as soon as the first response arrives, synthesizing later segments
+in parallel. Server disk cache (`X-TTS-Cache: HIT`) makes repeats near-instant.
+
 ### `GET /voices`
 
 Returns the Kokoro voice catalog and metadata. Requires auth when `API_KEY` is set.
@@ -131,7 +140,6 @@ List server voices with `GET /voices`.
 Push policy: keep this repo in sync with the `tts/` folder from
 `jdheitmann/Great-Big-World` whenever TTS server files change.
 
-
 ---
 
 ## Environment variables
@@ -173,7 +181,7 @@ Why **1 concurrent job**?
 
 **Do not** raise Uvicorn/Gunicorn `--workers` above 1 — each worker would reload the model.
 
-If Railway still has `MAX_CONCURRENT_TTS=2` set, either remove it or set it to `1`. After deploy, **restart** the service once if play is still stuck (a prior worker-slot leak may have wedged the live replica).
+If Railway still has `MAX_CONCURRENT_TTS=2` set, either remove it or set it to `1`. After deploy, **restart** the service once if play is still stuck (a prior leak may have wedged the live replica).
 
 ---
 
