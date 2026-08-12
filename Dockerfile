@@ -37,11 +37,45 @@ RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
 # Pre-download ONNX weights (~310MB) + voice pack (~27MB) for reliable cold starts.
+# GitHub release CDN often drops mid-transfer during Railway builds (curl exit 56).
+# Resume (-C -), retry transient errors, and verify exact Content-Length bytes.
 RUN mkdir -p /models \
-    && curl -fsSL --retry 3 -o /models/kokoro-v1.0.onnx \
-        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
-    && curl -fsSL --retry 3 -o /models/voices-v1.0.bin \
-        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+    && download() { \
+         dest="$1"; expect="$2"; url="$3"; \
+         attempt=1; \
+         while [ "$attempt" -le 10 ]; do \
+           if [ -f "$dest" ]; then \
+             size=$(wc -c < "$dest"); \
+             if [ "$size" -eq "$expect" ]; then \
+               echo "OK $dest ($size bytes)"; \
+               return 0; \
+             fi; \
+             echo "Incomplete $dest ($size/$expect); resuming..."; \
+           else \
+             echo "Downloading $dest (attempt $attempt)..."; \
+           fi; \
+           if curl -L --fail --retry 5 --retry-all-errors --retry-delay 3 \
+                --connect-timeout 30 --max-time 900 \
+                -C - -o "$dest" "$url"; then \
+             size=$(wc -c < "$dest"); \
+             if [ "$size" -eq "$expect" ]; then \
+               echo "OK $dest ($size bytes)"; \
+               return 0; \
+             fi; \
+             echo "Size mismatch after curl: got $size expected $expect"; \
+           else \
+             echo "curl failed for $dest (exit $?)"; \
+           fi; \
+           attempt=$((attempt + 1)); \
+           sleep $((attempt * 2)); \
+         done; \
+         echo "Failed to download $dest after retries"; \
+         return 1; \
+       } \
+    && download /models/kokoro-v1.0.onnx 325532387 \
+         https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
+    && download /models/voices-v1.0.bin 28214398 \
+         https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
 COPY app ./app
 
