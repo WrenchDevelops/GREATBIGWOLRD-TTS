@@ -1,8 +1,9 @@
-"""Kokoro TTS engine: one shared model, controlled concurrency, in-memory encoding."""
+"""Kokoro TTS engine: one ONNX session, controlled concurrency, in-memory encoding."""
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import logging
 import os
@@ -13,11 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
+import onnxruntime as ort
 import soundfile as sf
-import torch
+from kokoro_onnx import Kokoro
 
 from app.config import Settings
-from app.models import SUPPORTED_VOICES, VOICE_BY_ID
+from app.models import SUPPORTED_VOICES, espeak_lang_for_voice
 
 logger = logging.getLogger("kokoro_tts.engine")
 
@@ -27,21 +29,32 @@ CONTENT_TYPES = {
 }
 
 
+def rss_mb() -> int:
+    """Current process RSS in MiB, or 0 if unavailable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 class TTSEngine:
-    """Process-wide Kokoro engine with a single shared KModel."""
+    """Process-wide Kokoro ONNX engine. One session, one in-flight generation."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.sample_rate = settings.sample_rate
-        self._model = None
-        self._pipelines: dict[str, object] = {}
+        self._kokoro: Optional[Kokoro] = None
+        self._available_voices: set[str] = set()
         self._ready = False
         self._default_voice = settings.default_voice
         self._init_seconds: Optional[float] = None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_tts)
-        # Shared KModel/KPipeline is not safe for overlapping torch inference.
+        # ONNX session Run() is not safe to overlap on one session.
         self._infer_lock = threading.Lock()
-        # One worker thread per concurrent TTS slot keeps RAM predictable.
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_concurrent_tts,
             thread_name_prefix="kokoro-tts",
@@ -50,16 +63,14 @@ class TTSEngine:
         self._active_generations = 0
         self._active_started_at: Optional[float] = None
         self._stats_lock = threading.Lock()
+        self._exit_started = False
 
     @property
     def ready(self) -> bool:
         if not self._ready:
             return False
-        # If a timed-out worker is still stuck past 2x the request budget,
-        # fail health so the platform restarts the process.
         if self._workers_appear_stuck():
-            logger.error("TTS worker appears stuck; marking engine not ready for restart")
-            self._ready = False
+            self._mark_unhealthy_and_exit("worker appears stuck")
             return False
         return True
 
@@ -71,6 +82,10 @@ class TTSEngine:
     def init_seconds(self) -> Optional[float]:
         return self._init_seconds
 
+    @property
+    def available_voices(self) -> set[str]:
+        return set(self._available_voices)
+
     def _workers_appear_stuck(self) -> bool:
         with self._stats_lock:
             if self._active_generations <= 0 or self._active_started_at is None:
@@ -78,109 +93,116 @@ class TTSEngine:
             stuck_after = max(180.0, self.settings.request_timeout_seconds * 2)
             return (time.perf_counter() - self._active_started_at) > stuck_after
 
+    def _mark_unhealthy_and_exit(self, reason: str) -> None:
+        """Fail health and exit so Railway/Docker replace the replica.
+
+        Serving 503 forever after a wedged/OOM worker is how the app falls
+        back to on-device TTS. A process exit is the recovery path.
+        """
+        self._ready = False
+        if self._exit_started:
+            return
+        self._exit_started = True
+        logger.error(
+            "TTS engine unhealthy (%s) rss_mb=%s; exiting so the platform restarts",
+            reason,
+            rss_mb(),
+        )
+        threading.Thread(target=self._exit_soon, name="tts-exit", daemon=True).start()
+
+    @staticmethod
+    def _exit_soon() -> None:
+        time.sleep(0.25)
+        os._exit(1)
+
     def initialize(self) -> None:
-        """Load Kokoro once at startup. Safe to call only from lifespan startup."""
+        """Load Kokoro ONNX once at startup. Safe to call only from lifespan startup."""
         if self._ready:
             return
 
         started = time.perf_counter()
-        logger.info("Initializing Kokoro model repo=%s device=cpu", self.settings.model_repo)
+        logger.info(
+            "Initializing Kokoro ONNX model=%s voices=%s threads=%s rss_mb=%s",
+            self.settings.model_path,
+            self.settings.voices_path,
+            self.settings.onnx_num_threads,
+            rss_mb(),
+        )
 
-        # Force CPU-only inference and avoid thread oversubscription.
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        torch.set_num_threads(self.settings.torch_num_threads)
-        torch.set_num_interop_threads(self.settings.torch_num_interop_threads)
+        if not os.path.isfile(self.settings.model_path):
+            raise FileNotFoundError(f"ONNX model not found: {self.settings.model_path}")
+        if not os.path.isfile(self.settings.voices_path):
+            raise FileNotFoundError(f"Voice pack not found: {self.settings.voices_path}")
 
-        from kokoro import KModel, KPipeline
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = self.settings.onnx_num_threads
+        sess_options.inter_op_num_threads = 1
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_cpu_mem_arena = True
 
-        model = KModel(repo_id=self.settings.model_repo).to("cpu").eval()
-        self._model = model
-
-        # Warm English pipelines (American + British) with the shared model.
-        for lang_code in ("a", "b"):
-            self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code,
-                repo_id=self.settings.model_repo,
-                model=model,
-                device="cpu",
+        if hasattr(Kokoro, "from_session"):
+            session = ort.InferenceSession(
+                self.settings.model_path,
+                sess_options=sess_options,
+                providers=["CPUExecutionProvider"],
             )
+            kokoro = Kokoro.from_session(session, self.settings.voices_path)
+        else:
+            kokoro = Kokoro(self.settings.model_path, self.settings.voices_path)
+        self._kokoro = kokoro
+        self._available_voices = {name.lower() for name in kokoro.get_voices()}
 
         voice = self.settings.default_voice
-        if voice not in SUPPORTED_VOICES:
-            logger.warning(
-                "DEFAULT_VOICE=%s is not in the catalog; falling back to af_heart",
-                voice,
+        if voice not in self._available_voices:
+            fallback = "af_heart" if "af_heart" in self._available_voices else next(
+                iter(sorted(self._available_voices)),
+                "",
             )
-            voice = "af_heart"
+            logger.warning(
+                "DEFAULT_VOICE=%s is not in the ONNX voice pack; falling back to %s",
+                voice,
+                fallback,
+            )
+            voice = fallback
             self._default_voice = voice
+        if not voice:
+            raise RuntimeError("ONNX voice pack contains no voices")
 
-        # Verify default voice packs load and run a tiny warmup synthesis.
-        pipeline = self._pipeline_for_voice(voice)
-        pipeline.load_voice(voice)
         warmup_audio = self._synthesize_numpy("Kokoro ready.", voice=voice, speed=1.0)
         if warmup_audio.size == 0:
             raise RuntimeError("Warmup synthesis produced empty audio")
+        del warmup_audio
+        gc.collect()
 
         self._ready = True
         self._consecutive_timeouts = 0
         self._init_seconds = time.perf_counter() - started
         logger.info(
-            "Kokoro ready in %.2fs default_voice=%s concurrent=%s torch_threads=%s warmup_samples=%s",
+            "Kokoro ready in %.2fs default_voice=%s concurrent=%s onnx_threads=%s voices=%s rss_mb=%s",
             self._init_seconds,
             self._default_voice,
             self.settings.max_concurrent_tts,
-            self.settings.torch_num_threads,
-            int(warmup_audio.size),
+            self.settings.onnx_num_threads,
+            len(self._available_voices),
+            rss_mb(),
         )
 
-    def _pipeline_for_voice(self, voice: str):
-        meta = VOICE_BY_ID.get(voice)
-        if meta is None:
-            raise ValueError(f"Unsupported voice: {voice}")
-
-        lang_code = meta["lang_code"]
-        pipeline = self._pipelines.get(lang_code)
-        if pipeline is not None:
-            return pipeline
-
-        # Lazily create additional language pipelines, always reusing the shared model.
-        from kokoro import KPipeline
-
-        logger.info("Creating pipeline for lang_code=%s", lang_code)
-        try:
-            pipeline = KPipeline(
-                lang_code=lang_code,
-                repo_id=self.settings.model_repo,
-                model=self._model,
-                device="cpu",
-            )
-        except ImportError as exc:
-            raise ValueError(
-                f"Voice '{voice}' requires extra language dependencies that are not installed"
-            ) from exc
-        except Exception as exc:
-            raise ValueError(f"Unable to initialize pipeline for voice '{voice}': {exc}") from exc
-
-        self._pipelines[lang_code] = pipeline
-        return pipeline
-
     def _synthesize_numpy(self, text: str, voice: str, speed: float) -> np.ndarray:
-        pipeline = self._pipeline_for_voice(voice)
-        chunks: list[np.ndarray] = []
-
-        for result in pipeline(text, voice=voice, speed=speed, split_pattern=r"\n+"):
-            audio = result.audio
-            if audio is None:
-                continue
-            if hasattr(audio, "detach"):
-                audio = audio.detach().cpu().numpy()
-            arr = np.asarray(audio, dtype=np.float32).reshape(-1)
-            if arr.size:
-                chunks.append(arr)
-
-        if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks)
+        if self._kokoro is None:
+            raise RuntimeError("TTS engine is not initialized")
+        lang = espeak_lang_for_voice(voice)
+        audio, sample_rate = self._kokoro.create(
+            text,
+            voice=voice,
+            speed=speed,
+            lang=lang,
+        )
+        if sample_rate:
+            self.sample_rate = int(sample_rate)
+        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        return arr
 
     def _encode_audio(self, audio: np.ndarray, fmt: str) -> bytes:
         fmt = fmt.lower()
@@ -199,6 +221,7 @@ class TTSEngine:
         wav_buffer = io.BytesIO()
         sf.write(wav_buffer, audio, self.sample_rate, format="WAV", subtype="PCM_16")
         wav_bytes = wav_buffer.getvalue()
+        wav_buffer.close()
 
         process = subprocess.run(
             [
@@ -223,6 +246,7 @@ class TTSEngine:
             capture_output=True,
             check=False,
         )
+        del wav_bytes
         if process.returncode != 0:
             stderr = process.stderr.decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"ffmpeg MP3 encoding failed: {stderr}")
@@ -232,12 +256,13 @@ class TTSEngine:
 
     def generate_sync(self, text: str, voice: str, speed: float, fmt: str) -> bytes:
         """Blocking synthesis + encode. Intended to run in the thread pool."""
-        if not self._ready or self._model is None:
+        if not self._ready or self._kokoro is None:
             raise RuntimeError("TTS engine is not initialized")
-        if voice not in SUPPORTED_VOICES:
-            raise ValueError(f"Unsupported voice: {voice}")
+        if voice not in self._available_voices:
+            if voice not in SUPPORTED_VOICES:
+                raise ValueError(f"Unsupported voice: {voice}")
+            raise ValueError(f"Voice '{voice}' is not in the loaded ONNX voice pack")
 
-        # Serialize torch inference — concurrent calls on one KModel deadlock/hang on CPU.
         with self._infer_lock:
             with self._stats_lock:
                 self._active_generations += 1
@@ -253,7 +278,11 @@ class TTSEngine:
 
         if audio.size == 0:
             raise RuntimeError("Synthesis produced empty audio")
-        return self._encode_audio(audio, fmt)
+        try:
+            return self._encode_audio(audio, fmt)
+        finally:
+            del audio
+            gc.collect()
 
     def _note_success(self) -> None:
         self._consecutive_timeouts = 0
@@ -261,15 +290,13 @@ class TTSEngine:
     def _note_timeout(self, kind: str) -> None:
         self._consecutive_timeouts += 1
         logger.error(
-            "TTS %s timeout consecutive=%s",
+            "TTS %s timeout consecutive=%s rss_mb=%s",
             kind,
             self._consecutive_timeouts,
+            rss_mb(),
         )
-        # After repeated timeouts the thread pool is likely wedged; fail health
-        # so Railway/Docker restarts a clean process.
         if self._consecutive_timeouts >= 2:
-            logger.error("Marking TTS engine not ready after repeated timeouts")
-            self._ready = False
+            self._mark_unhealthy_and_exit("repeated timeouts")
 
     async def generate(
         self,
@@ -304,12 +331,10 @@ class TTSEngine:
             result = await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
             self._note_success()
             if queue_ms > 50:
-                logger.info("TTS queue wait ms=%s", queue_ms)
+                logger.info("TTS queue wait ms=%s rss_mb=%s", queue_ms, rss_mb())
             return result
         except asyncio.TimeoutError as exc:
             # Keep the slot occupied until the worker finishes so RAM stays bounded.
-            # Do NOT release here — a return inside `try` would also skip a bare
-            # `else:` release (that bug wedged production after 2 successes).
             release_on_exit = False
             future.add_done_callback(lambda _f: self._semaphore.release())
             self._note_timeout("generation")
@@ -321,3 +346,4 @@ class TTSEngine:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._ready = False
+        self._kokoro = None
