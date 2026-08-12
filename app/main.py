@@ -16,14 +16,13 @@ from app import __version__
 from app.cache import AudioCache
 from app.config import Settings, get_settings
 from app.models import (
-    SUPPORTED_VOICES,
     VOICE_CATALOG,
     HealthResponse,
     TTSRequest,
     VoiceInfo,
     VoicesResponse,
 )
-from app.tts import CONTENT_TYPES, TTSEngine
+from app.tts import CONTENT_TYPES, TTSEngine, rss_mb
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,10 +50,12 @@ async def lifespan(app: FastAPI):
     configure_logging(settings)
 
     logger.info(
-        "Starting Kokoro TTS API v%s max_concurrent=%s cache_dir=%s",
+        "Starting Kokoro TTS API v%s max_concurrent=%s cache_dir=%s model=%s rss_mb=%s",
         __version__,
         settings.max_concurrent_tts,
         settings.cache_dir,
+        settings.model_path,
+        rss_mb(),
     )
 
     audio_cache = AudioCache(
@@ -83,7 +84,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Kokoro TTS API",
-    description="Self-hosted Kokoro text-to-speech API optimized for CPU Railway deployments.",
+    description="Self-hosted Kokoro text-to-speech API (ONNX Runtime, CPU) for Railway.",
     version=__version__,
     lifespan=lifespan,
 )
@@ -161,6 +162,7 @@ async def warmup(settings: Settings = Depends(get_settings)) -> HealthResponse:
 
 @app.get("/voices", response_model=VoicesResponse, dependencies=[Depends(require_api_key)])
 async def list_voices(settings: Settings = Depends(get_settings)) -> VoicesResponse:
+    loaded = engine.available_voices if engine is not None and engine.ready else None
     voices = [
         VoiceInfo(
             id=item["id"],
@@ -173,6 +175,7 @@ async def list_voices(settings: Settings = Depends(get_settings)) -> VoicesRespo
             default=item["id"] == settings.default_voice,
         )
         for item in VOICE_CATALOG
+        if loaded is None or item["id"] in loaded
     ]
     return VoicesResponse(
         default_voice=settings.default_voice,
@@ -200,7 +203,7 @@ async def synthesize(
             status_code=400,
             detail=f"text exceeds maximum length of {settings.max_text_length} characters",
         )
-    if voice not in SUPPORTED_VOICES:
+    if voice not in tts.available_voices:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported voice '{voice}'. Use GET /voices for available options.",
@@ -214,12 +217,13 @@ async def synthesize(
         raise HTTPException(status_code=400, detail="format must be 'mp3' or 'wav'")
 
     logger.info(
-        "request received path=/tts chars=%s voice=%s speed=%.2f format=%s client=%s",
+        "request received path=/tts chars=%s voice=%s speed=%.2f format=%s client=%s rss_mb=%s",
         len(text),
         voice,
         speed,
         fmt,
         request.client.host if request.client else "unknown",
+        rss_mb(),
     )
 
     cache_key = AudioCache.make_key(text, voice, speed, fmt)
@@ -268,12 +272,13 @@ async def synthesize(
     cache.put(cache_key, fmt, audio_bytes)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "generation complete chars=%s voice=%s format=%s bytes=%s generation_ms=%s",
+        "generation complete chars=%s voice=%s format=%s bytes=%s generation_ms=%s rss_mb=%s",
         len(text),
         voice,
         fmt,
         len(audio_bytes),
         elapsed_ms,
+        rss_mb(),
     )
 
     return Response(

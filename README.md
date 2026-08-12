@@ -1,16 +1,18 @@
 # Kokoro TTS API
 
-Self-hosted [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech API for Great Big World.
+Self-hosted [Kokoro](https://github.com/hexgrad/kokoro) text-to-speech API for
+**Great Big World**, deployed as a standalone Railway service.
 
-Production-ready FastAPI service designed for **Railway**, **CPU-only**,
-**8 vCPU / 8 GB RAM**:
+Production-ready FastAPI service designed for **Railway**, **CPU-only ONNX**,
+**8 vCPU / 8 GB RAM** (typical RSS ~1.5–2.5 GB, well under the plan cap):
 
-- One shared Kokoro model loaded at startup
+- One shared Kokoro ONNX session loaded at startup (no PyTorch)
 - Single Uvicorn worker (no duplicated model RAM)
-- Single in-flight generation by default (shared model is not thread-safe)
+- Single in-flight generation by default (ONNX session is not thread-safe)
 - Disk audio cache with SHA-256 keys
 - Optional Bearer API key auth
 - WAV + MP3 output (MP3 default)
+- Process exits after a wedged/unhealthy engine so Railway restarts instead of serving 503 forever
 
 Default voice: **`af_heart`** (high-quality American English).
 
@@ -71,7 +73,7 @@ Returns audio bytes with:
 - Python 3.11+
 - [`espeak-ng`](https://github.com/espeak-ng/espeak-ng)
 - [`ffmpeg`](https://ffmpeg.org/)
-- CPU-only PyTorch
+- Kokoro ONNX weights (`kokoro-v1.0.onnx` + `voices-v1.0.bin`)
 
 macOS:
 
@@ -89,18 +91,25 @@ sudo apt-get install -y espeak-ng ffmpeg libsndfile1
 ### Setup
 
 ```bash
-cd GREATBIGWOLRD-TTS
+# From the Great Big World repository root:
+cd tts
 python3.11 -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0
 pip install -r requirements.txt
+
+mkdir -p /tmp/kokoro-models
+curl -fsSL -o /tmp/kokoro-models/kokoro-v1.0.onnx \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -fsSL -o /tmp/kokoro-models/voices-v1.0.bin \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
 cp .env.example .env
 export $(grep -v '^#' .env | xargs)
+export MODEL_PATH=/tmp/kokoro-models/kokoro-v1.0.onnx
+export VOICES_PATH=/tmp/kokoro-models/voices-v1.0.bin
 
-# First run downloads Kokoro-82M weights (~300MB) into the Hugging Face cache.
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
@@ -119,26 +128,26 @@ docker run --rm -p 8000:8000 \
 
 ## Deploy on Railway
 
-1. Connect this GitHub repo in Railway: **New Project → Deploy from GitHub repo**.
-2. Railway uses the root `Dockerfile` / `railway.json`.
-3. Set environment variables (below).
-4. Optional but recommended: add a **persistent volume** mounted at `/app/cache`.
-5. Deploy. Cold start includes model load; healthcheck start period is generous.
+Production runs from the standalone TTS repo
+([WrenchDevelops/GREATBIGWOLRD-TTS](https://github.com/WrenchDevelops/GREATBIGWOLRD-TTS)):
+**Root Directory empty**, `Dockerfile` at the repo root.
+
+The same files also live in the Great Big World monorepo under `tts/` if you deploy
+from there instead (set **Root Directory** to `tts`).
+
+1. Push this service to GitHub.
+2. In Railway: **New Project → Deploy from GitHub repo** (or add a service).
+3. Leave Root Directory empty for the standalone repo (or `tts` for the monorepo).
+4. Railway uses `Dockerfile` and `railway.json`.
+5. Set environment variables (below). Keep `MAX_CONCURRENT_TTS=1`.
+6. Optional but recommended: add a **persistent volume** mounted at `/app/cache`.
+7. Deploy. Cold start includes model load; healthcheck start period is generous.
 
 The process listens on `0.0.0.0:$PORT` with **one worker**.
 
-## Used by Great Big World (mobile app)
-
-Production host:
-
-`https://greatbigwolrd-tts-production.up.railway.app`
-
-The MAUI app calls `POST /tts` with a selected Kokoro `voice` (for example `af_heart`,
-`af_bella`, `bf_emma`). Users change voices in the app **Settings → Guide voice** picker.
-List server voices with `GET /voices`.
-
-Push policy: keep this repo in sync with the `tts/` folder from
-`jdheitmann/Great-Big-World` whenever TTS server files change.
+If `/health` returns 503 after a successful deploy, the replica is unhealthy and
+will exit so Railway restarts it. Persistent 503s on the old PyTorch image meant
+the process was wedged at the 8 GB cap and the app fell back to device TTS.
 
 ---
 
@@ -153,35 +162,41 @@ Push policy: keep this repo in sync with the `tts/` folder from
 | `DEFAULT_FORMAT` | `mp3` | `mp3` or `wav` |
 | `MAX_TEXT_LENGTH` | `2000` | Max characters per request |
 | `MAX_CONCURRENT_TTS` | `1` | In-flight generations (keep at 1) |
-| `TORCH_NUM_THREADS` | `4` | PyTorch intra-op threads |
-| `TORCH_NUM_INTEROP_THREADS` | `1` | PyTorch inter-op threads |
+| `ONNX_NUM_THREADS` | `4` | ONNX Runtime intra-op threads (`TORCH_NUM_THREADS` still accepted) |
 | `REQUEST_TIMEOUT_SECONDS` | `120` | Queue + generation timeout |
 | `CACHE_ENABLED` | `true` | Enable disk cache |
 | `CACHE_DIR` | `/app/cache` | Cache directory |
-| `CACHE_MAX_BYTES` | `2147483648` | ~2 GB cache budget |
+| `CACHE_MAX_BYTES` | `536870912` | ~512 MB cache budget |
 | `LOG_LEVEL` | `INFO` | Logging level |
-| `MODEL_REPO` | `hexgrad/Kokoro-82M` | Hugging Face model repo |
+| `MODEL_PATH` | `/models/kokoro-v1.0.onnx` | ONNX model path |
+| `VOICES_PATH` | `/models/voices-v1.0.bin` | Voice pack path |
 
 ### Recommended for 8 vCPU / 8 GB
 
 ```bash
 MAX_CONCURRENT_TTS=1
-TORCH_NUM_THREADS=4
+ONNX_NUM_THREADS=4
 CACHE_ENABLED=true
 CACHE_DIR=/app/cache
-CACHE_MAX_BYTES=2147483648
+CACHE_MAX_BYTES=536870912
 DEFAULT_VOICE=af_heart
 ```
 
+Why **ONNX instead of PyTorch**?
+
+- PyTorch + spaCy + two Kokoro pipelines idle around several GB and spike over 8 GB during inference.
+- The same Kokoro-82M voice via ONNX Runtime typically sits around 1.5–2.5 GB RSS.
+- When the engine wedges, the process **exits** so Railway replaces the replica instead of returning 503 forever (which made the app fall back to device TTS).
+
 Why **1 concurrent job**?
 
-- One shared `KModel` is loaded in-process; overlapping torch inference can hang.
+- One shared ONNX session; overlapping `Run()` is not safe.
 - A threading lock serializes synthesis even if you raise the limit.
-- Spend CPU on one high-quality job (`TORCH_NUM_THREADS=4`) instead of contending jobs.
+- Spend CPU on one high-quality job (`ONNX_NUM_THREADS=4`) instead of contending jobs.
 
 **Do not** raise Uvicorn/Gunicorn `--workers` above 1 — each worker would reload the model.
 
-If Railway still has `MAX_CONCURRENT_TTS=2` set, either remove it or set it to `1`. After deploy, **restart** the service once if play is still stuck (a prior leak may have wedged the live replica).
+If Railway still has `MAX_CONCURRENT_TTS=2` or a 2 GB `CACHE_MAX_BYTES` set, set them to the values above. After deploy, **restart** the service once if play is still on the device voice.
 
 ---
 
@@ -261,7 +276,7 @@ If `API_KEY` is unset, auth is disabled.
 ```bash
 CACHE_ENABLED=true
 CACHE_DIR=/app/cache
-CACHE_MAX_BYTES=2147483648
+CACHE_MAX_BYTES=536870912
 ```
 
 Cache key:
@@ -340,7 +355,7 @@ document.getElementById("speak").onclick = async () => {
 ```text
 app/
   main.py      FastAPI routes, auth, CORS, response headers
-  tts.py       Shared KModel + language pipelines + semaphore
+  tts.py       Shared ONNX session + semaphore + restart-on-unhealthy
   cache.py     SHA-256 disk cache + size eviction
   config.py    Environment configuration
   models.py    Request validation + voice catalog
@@ -348,9 +363,9 @@ app/
 
 Startup flow:
 
-1. Configure CPU thread limits
-2. Load one `KModel` on CPU
-3. Create American/British `KPipeline`s reusing that model
+1. Configure ONNX thread limits
+2. Load one Kokoro ONNX session on CPU
+3. Load the voice pack
 4. Verify `DEFAULT_VOICE` and warm up synthesis
 5. Serve requests forever without reloading weights
 
@@ -372,4 +387,5 @@ Startup flow:
 
 - This service code: use freely in your project.
 - Kokoro-82M model weights: Apache-2.0 ([hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)).
-- The Docker image pre-downloads model weights for reliable deploys.
+- ONNX export used at runtime: [kokoro-onnx model-files-v1.0](https://github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0).
+- The Docker image pre-downloads ONNX weights for reliable deploys.

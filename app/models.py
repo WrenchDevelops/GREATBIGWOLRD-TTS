@@ -81,6 +81,26 @@ VOICE_CATALOG: list[dict] = [
 VOICE_BY_ID: dict[str, dict] = {voice["id"]: voice for voice in VOICE_CATALOG}
 SUPPORTED_VOICES: set[str] = set(VOICE_BY_ID.keys())
 
+# kokoro-onnx / espeak-ng language tags keyed by Kokoro lang_code.
+_ESPEAK_LANG = {
+    "a": "en-us",
+    "b": "en-gb",
+    "e": "es",
+    "f": "fr-fr",
+    "h": "hi",
+    "i": "it",
+    "j": "ja",
+    "p": "pt-br",
+    "z": "cmn",
+}
+
+
+def espeak_lang_for_voice(voice: str) -> str:
+    meta = VOICE_BY_ID.get(voice)
+    if meta is None:
+        return "en-us"
+    return _ESPEAK_LANG.get(meta["lang_code"], meta.get("language") or "en-us")
+
 
 class TTSRequest(BaseModel):
     """JSON body for POST /tts."""
